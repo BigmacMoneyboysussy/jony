@@ -1,0 +1,1248 @@
+import logging
+import asyncio
+from datetime import datetime, time, date, timedelta
+from typing import Dict, List, Optional, Tuple
+from contextlib import asynccontextmanager
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardRemove
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+    ConversationHandler,
+    JobQueue,
+)
+
+from database import db, User, Department, Doctor, Appointment, DoctorSchedule
+from config import config
+
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Состояния для ConversationHandler
+(
+    SELECT_DEPARTMENT,
+    SELECT_DOCTOR,
+    SELECT_DATE,
+    SELECT_TIME,
+    ENTER_NAME,
+    ENTER_PHONE,
+    ENTER_BIRTHDATE,
+    ENTER_SYMPTOMS,
+    CONFIRM
+) = range(9)
+
+
+class HospitalBot:
+    def __init__(self):
+        self.app = None
+
+    async def ensure_user(self, telegram_id: int, username: str = None,
+                          first_name: str = None, last_name: str = None) -> User:
+        """Создает или возвращает пользователя в БД"""
+        async with db.get_session() as session:
+            # Проверяем, существует ли пользователь
+            result = await session.execute(
+                select(User).where(User.telegram_id == telegram_id)
+            )
+            user = result.scalar_one_or_none()
+
+            if not user:
+                # Создаем нового пользователя
+                user = User(
+                    telegram_id=telegram_id,
+                    username=username,
+                    first_name=first_name,
+                    last_name=last_name
+                )
+                session.add(user)
+                await session.flush()
+
+            return user
+
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик команды /start"""
+        user = update.effective_user
+
+        # Создаем/получаем пользователя в БД
+        await self.ensure_user(
+            telegram_id=user.id,
+            username=user.username,
+            first_name=user.first_name,
+            last_name=user.last_name
+        )
+
+        welcome_text = f"""
+👋 Здравствуйте, {user.first_name}!
+
+Добро пожаловать в систему онлайн-записи к врачу!
+
+Доступные команды:
+/start - Начало работы
+/record - Записаться на прием
+/my_records - Мои записи
+/cancel - Отмена текущего действия
+
+Для администраторов:
+/admin - Панель управления
+        """
+
+        keyboard = [
+            [KeyboardButton("📅 Записаться на прием")],
+            [KeyboardButton("📋 Мои записи")],
+            [KeyboardButton("🏥 Отделения")],
+            [KeyboardButton("👨‍⚕️ Наши врачи")]
+        ]
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+        await update.message.reply_text(welcome_text, reply_markup=reply_markup)
+        return ConversationHandler.END
+
+    async def start_record(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Начало процесса записи"""
+        # Очищаем данные пользователя
+        context.user_data.clear()
+
+        # Получаем отделения из БД
+        async with db.get_session() as session:
+            result = await session.execute(
+                select(Department).where(Department.is_active == True)
+            )
+            departments = result.scalars().all()
+
+        if not departments:
+            await update.message.reply_text(
+                "В настоящее время нет доступных отделений. Пожалуйста, попробуйте позже."
+            )
+            return ConversationHandler.END
+
+        # Создаем клавиатуру с отделениями
+        keyboard = []
+        for dept in departments:
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"🏥 {dept.name}",
+                    callback_data=f"dept_{dept.id}"
+                )
+            ])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await update.message.reply_text(
+            "🏥 Выберите отделение:",
+            reply_markup=reply_markup
+        )
+
+        return SELECT_DEPARTMENT
+
+    async def select_department(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Выбор отделения"""
+        query = update.callback_query
+        await query.answer()
+
+        department_id = int(query.data.split("_")[1])
+        context.user_data["department_id"] = department_id
+
+        # Получаем врачей отделения
+        async with db.get_session() as session:
+            result = await session.execute(
+                select(Doctor)
+                .where(Doctor.department_id == department_id)
+                .where(Doctor.is_active == True)
+            )
+            doctors = result.scalars().all()
+
+        if not doctors:
+            await query.edit_message_text(
+                "В этом отделении временно нет доступных врачей. "
+                "Пожалуйста, выберите другое отделение."
+            )
+            return SELECT_DEPARTMENT
+
+        # Создаем клавиатуру с врачами
+        keyboard = []
+        for doctor in doctors:
+            # Сокращаем текст если нужно
+            button_text = f"👨‍⚕️ {doctor.full_name}"
+            if len(button_text) > 64:  # Максимальная длина callback_data
+                button_text = button_text[:61] + "..."
+
+            keyboard.append([
+                InlineKeyboardButton(
+                    button_text,
+                    callback_data=f"doc_{doctor.id}"
+                )
+            ])
+
+        keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_dept")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        # Получаем название отделения
+        async with db.get_session() as session:
+            result = await session.execute(
+                select(Department).where(Department.id == department_id)
+            )
+            department = result.scalar_one()
+
+        await query.edit_message_text(
+            f"🏥 Отделение: {department.name}\n\n"
+            "👨‍⚕️ Выберите врача:",
+            reply_markup=reply_markup
+        )
+
+        return SELECT_DOCTOR
+
+    async def select_doctor(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Выбор врача"""
+        query = update.callback_query
+        await query.answer()
+
+        if query.data == "back_to_dept":
+            # Возвращаемся к выбору отделения
+            async with db.get_session() as session:
+                result = await session.execute(
+                    select(Department).where(Department.is_active == True)
+                )
+                departments = result.scalars().all()
+
+            keyboard = []
+            for dept in departments:
+                keyboard.append([
+                    InlineKeyboardButton(
+                        f"🏥 {dept.name}",
+                        callback_data=f"dept_{dept.id}"
+                    )
+                ])
+
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                "🏥 Выберите отделение:",
+                reply_markup=reply_markup
+            )
+            return SELECT_DEPARTMENT
+
+        doctor_id = int(query.data.split("_")[1])
+        context.user_data["doctor_id"] = doctor_id
+
+        # Получаем информацию о враче
+        async with db.get_session() as session:
+            result = await session.execute(
+                select(Doctor).where(Doctor.id == doctor_id)
+            )
+            doctor = result.scalar_one()
+
+            result = await session.execute(
+                select(Department).where(Department.id == doctor.department_id)
+            )
+            department = result.scalar_one()
+
+        # Генерируем даты на 2 недели вперед
+        keyboard = []
+        today = datetime.now().date()
+
+        for i in range(1, 31):  # 30 дней вперед
+            appointment_date = today + timedelta(days=i)
+
+            # Проверяем, работает ли врач в этот день
+            day_of_week = appointment_date.weekday()  # 0-пн, 6-вс
+
+            async with db.get_session() as session:
+                result = await session.execute(
+                    select(DoctorSchedule)
+                    .where(DoctorSchedule.doctor_id == doctor_id)
+                    .where(DoctorSchedule.day_of_week == day_of_week)
+                    .where(DoctorSchedule.is_working == True)
+                )
+                schedule = result.scalar_one_or_none()
+
+            if schedule:
+                button_text = appointment_date.strftime("%d.%m.%Y (%a)")
+                keyboard.append([
+                    InlineKeyboardButton(
+                        button_text,
+                        callback_data=f"date_{appointment_date.strftime('%Y-%m-%d')}"
+                    )
+                ])
+
+        if not keyboard:
+            await query.edit_message_text(
+                f"У врача {doctor.full_name} нет рабочих дней в ближайшие 30 дней. "
+                "Пожалуйста, выберите другого врача."
+            )
+            return SELECT_DOCTOR
+
+        keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_doctors")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await query.edit_message_text(
+            f"👨‍⚕️ Врач: {doctor.full_name}\n"
+            f"🏥 Отделение: {department.name}\n"
+            f"📋 Специализация: {doctor.specialization}\n\n"
+            "📅 Выберите дату приема:",
+            reply_markup=reply_markup
+        )
+
+        return SELECT_DATE
+
+    async def select_date(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Выбор даты"""
+        query = update.callback_query
+        await query.answer()
+
+        if query.data == "back_to_doctors":
+            # Возвращаемся к выбору врача
+            department_id = context.user_data.get("department_id")
+
+            async with db.get_session() as session:
+                result = await session.execute(
+                    select(Doctor)
+                    .where(Doctor.department_id == department_id)
+                    .where(Doctor.is_active == True)
+                )
+                doctors = result.scalars().all()
+
+            keyboard = []
+            for doctor in doctors:
+                button_text = f"👨‍⚕️ {doctor.full_name}"
+                if len(button_text) > 64:
+                    button_text = button_text[:61] + "..."
+
+                keyboard.append([
+                    InlineKeyboardButton(
+                        button_text,
+                        callback_data=f"doc_{doctor.id}"
+                    )
+                ])
+
+            keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_dept")])
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await query.edit_message_text(
+                "👨‍⚕️ Выберите врача:",
+                reply_markup=reply_markup
+            )
+            return SELECT_DOCTOR
+
+        selected_date = query.data.split("_")[1]
+        context.user_data["appointment_date"] = selected_date
+
+        # Получаем доступное время
+        doctor_id = context.user_data["doctor_id"]
+        appointment_date = datetime.strptime(selected_date, "%Y-%m-%d").date()
+        day_of_week = appointment_date.weekday()
+
+        async with db.get_session() as session:
+            # Получаем расписание врача
+            result = await session.execute(
+                select(DoctorSchedule)
+                .where(DoctorSchedule.doctor_id == doctor_id)
+                .where(DoctorSchedule.day_of_week == day_of_week)
+            )
+            schedule = result.scalar_one()
+
+            # Получаем уже занятое время
+            result = await session.execute(
+                select(Appointment.appointment_time)
+                .where(Appointment.doctor_id == doctor_id)
+                .where(Appointment.appointment_date == appointment_date)
+                .where(Appointment.status.in_(["pending", "confirmed"]))
+            )
+            booked_times = [t[0] for t in result.all()]
+
+        # Генерируем доступные слоты времени
+        available_times = self._generate_time_slots(
+            schedule.start_time,
+            schedule.end_time,
+            schedule.break_start,
+            schedule.break_end,
+            schedule.appointment_duration,
+            booked_times
+        )
+
+        if not available_times:
+            await query.edit_message_text(
+                "На выбранную дату нет свободного времени. "
+                "Пожалуйста, выберите другую дату."
+            )
+            return SELECT_DATE
+
+        # Создаем клавиатуру со временем
+        keyboard = []
+        row = []
+        for i, time_slot in enumerate(available_times):
+            row.append(InlineKeyboardButton(
+                time_slot.strftime("%H:%M"),
+                callback_data=f"time_{time_slot.strftime('%H:%M')}"
+            ))
+            if len(row) == 3 or i == len(available_times) - 1:
+                keyboard.append(row)
+                row = []
+
+        keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_dates")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await query.edit_message_text(
+            "⏰ Выберите время приема:",
+            reply_markup=reply_markup
+        )
+
+        return SELECT_TIME
+
+    def _generate_time_slots(self, start_time: time, end_time: time,
+                             break_start: Optional[time], break_end: Optional[time],
+                             duration_minutes: int, booked_times: List[time]) -> List[time]:
+        """Генерирует доступные слоты времени"""
+        slots = []
+        current = datetime.combine(date.today(), start_time)
+        end = datetime.combine(date.today(), end_time)
+
+        if break_start and break_end:
+            break_start_dt = datetime.combine(date.today(), break_start)
+            break_end_dt = datetime.combine(date.today(), break_end)
+
+        while current + timedelta(minutes=duration_minutes) <= end:
+            # Проверяем, не попадает ли слот на перерыв
+            is_break = False
+            if break_start and break_end:
+                slot_end = current + timedelta(minutes=duration_minutes)
+                if current < break_end_dt and slot_end > break_start_dt:
+                    is_break = True
+
+            # Проверяем, не занято ли время
+            is_booked = current.time() in booked_times
+
+            if not is_break and not is_booked:
+                slots.append(current.time())
+
+            current += timedelta(minutes=duration_minutes)
+
+        return slots
+
+    async def select_time(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Выбор времени"""
+        query = update.callback_query
+        await query.answer()
+
+        if query.data == "back_to_dates":
+            # Возвращаемся к выбору даты
+            doctor_id = context.user_data["doctor_id"]
+
+            # Генерируем даты на 2 недели вперед
+            keyboard = []
+            today = datetime.now().date()
+
+            for i in range(1, 31):
+                appointment_date = today + timedelta(days=i)
+                day_of_week = appointment_date.weekday()
+
+                async with db.get_session() as session:
+                    result = await session.execute(
+                        select(DoctorSchedule)
+                        .where(DoctorSchedule.doctor_id == doctor_id)
+                        .where(DoctorSchedule.day_of_week == day_of_week)
+                        .where(DoctorSchedule.is_working == True)
+                    )
+                    schedule = result.scalar_one_or_none()
+
+                if schedule:
+                    button_text = appointment_date.strftime("%d.%m.%Y (%a)")
+                    keyboard.append([
+                        InlineKeyboardButton(
+                            button_text,
+                            callback_data=f"date_{appointment_date.strftime('%Y-%m-%d')}"
+                        )
+                    ])
+
+            keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_doctors")])
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            # Получаем информацию о враче
+            async with db.get_session() as session:
+                result = await session.execute(
+                    select(Doctor).where(Doctor.id == doctor_id)
+                )
+                doctor = result.scalar_one()
+
+                result = await session.execute(
+                    select(Department).where(Department.id == doctor.department_id)
+                )
+                department = result.scalar_one()
+
+            await query.edit_message_text(
+                f"👨‍⚕️ Врач: {doctor.full_name}\n"
+                f"🏥 Отделение: {department.name}\n\n"
+                "📅 Выберите дату приема:",
+                reply_markup=reply_markup
+            )
+            return SELECT_DATE
+
+        selected_time = query.data.split("_")[1]
+        context.user_data["appointment_time"] = selected_time
+
+        # Запрашиваем ФИО пациента
+        await query.edit_message_text(
+            "👤 Введите ваше ФИО (полностью):\n\n"
+            "Пример: Иванов Иван Иванович\n\n"
+            "⚠️ Пожалуйста, вводите свои настоящие данные, "
+            "они понадобятся для оформления медицинской карты."
+        )
+
+        return ENTER_NAME
+
+    async def enter_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Ввод ФИО пациента"""
+        name = update.message.text.strip()
+
+        # Простая валидация
+        if len(name) < 5 or len(name.split()) < 2:
+            await update.message.reply_text(
+                "❌ Пожалуйста, введите ФИО полностью (минимум 2 слова, не менее 5 символов).\n"
+                "Пример: Иванов Иван Иванович"
+            )
+            return ENTER_NAME
+
+        context.user_data["patient_name"] = name
+
+        # Запрашиваем телефон
+        keyboard = [
+            [KeyboardButton("📱 Поделиться номером телефона", request_contact=True)]
+        ]
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+
+        await update.message.reply_text(
+            "📱 Введите ваш номер телефона или нажмите кнопку ниже:\n\n"
+            "Пример: +79161234567",
+            reply_markup=reply_markup
+        )
+
+        return ENTER_PHONE
+
+    async def enter_phone(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Ввод телефона"""
+        phone = None
+
+        if update.message.contact:
+            # Если пользователь поделился контактом
+            phone = update.message.contact.phone_number
+        else:
+            # Если ввел вручную
+            phone = update.message.text.strip()
+
+        # Валидация телефона
+        if not self._validate_phone(phone):
+            await update.message.reply_text(
+                "❌ Пожалуйста, введите корректный номер телефона.\n"
+                "Пример: +79161234567 или 89161234567"
+            )
+            return ENTER_PHONE
+
+        context.user_data["patient_phone"] = phone
+
+        # Спрашиваем дату рождения
+        keyboard = [
+            [KeyboardButton("Сегодня")],
+            [KeyboardButton("Не указывать")]
+        ]
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+
+        await update.message.reply_text(
+            "📅 Введите вашу дату рождения (для медицинской карты):\n\n"
+            "Формат: ДД.ММ.ГГГГ\n"
+            "Пример: 15.05.1990\n\n"
+            "Или нажмите кнопку ниже:",
+            reply_markup=reply_markup
+        )
+
+        return ENTER_BIRTHDATE
+
+    async def enter_birthdate(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Ввод даты рождения"""
+        birthdate_input = update.message.text.strip()
+        birthdate = None
+
+        if birthdate_input == "Сегодня":
+            birthdate = datetime.now().date()
+        elif birthdate_input == "Не указывать":
+            birthdate = None
+        else:
+            try:
+                birthdate = datetime.strptime(birthdate_input, "%d.%m.%Y").date()
+
+                # Проверяем, что дата не в будущем
+                if birthdate > datetime.now().date():
+                    await update.message.reply_text(
+                        "❌ Дата рождения не может быть в будущем. "
+                        "Пожалуйста, введите корректную дату."
+                    )
+                    return ENTER_BIRTHDATE
+
+            except ValueError:
+                await update.message.reply_text(
+                    "❌ Неверный формат даты. Пожалуйста, используйте формат ДД.ММ.ГГГГ\n"
+                    "Пример: 15.05.1990"
+                )
+                return ENTER_BIRTHDATE
+
+        if birthdate:
+            context.user_data["patient_birthdate"] = birthdate.isoformat()
+
+        # Спрашиваем симптомы/жалобы
+        keyboard = [
+            [KeyboardButton("Пропустить")],
+            [KeyboardButton("Не знаю")]
+        ]
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+
+        await update.message.reply_text(
+            "📝 Опишите ваши симптомы или жалобы (необязательно):\n\n"
+            "Эта информация поможет врачу подготовиться к приему.\n"
+            "Пример: 'Болит горло, температура 37.5, кашель'",
+            reply_markup=reply_markup,
+            reply_to_message_id=update.message.message_id
+        )
+
+        return ENTER_SYMPTOMS
+
+    async def enter_symptoms(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Ввод симптомов"""
+        symptoms = update.message.text.strip()
+
+        if symptoms in ["Пропустить", "Не знаю", "Нет", "Не указано"]:
+            symptoms = None
+
+        if symptoms:
+            context.user_data["symptoms"] = symptoms
+
+        # Формируем информацию для подтверждения
+        doctor_id = context.user_data["doctor_id"]
+        appointment_date = context.user_data["appointment_date"]
+        appointment_time = context.user_data["appointment_time"]
+
+        async with db.get_session() as session:
+            # Получаем информацию о враче
+            result = await session.execute(
+                select(Doctor).where(Doctor.id == doctor_id)
+            )
+            doctor = result.scalar_one()
+
+            result = await session.execute(
+                select(Department).where(Department.id == doctor.department_id)
+            )
+            department = result.scalar_one()
+
+        # Форматируем дату и время
+        date_str = datetime.strptime(appointment_date, "%Y-%m-%d").strftime("%d.%m.%Y")
+        time_str = appointment_time
+
+        confirm_text = f"""
+✅ Пожалуйста, подтвердите запись:
+
+👨‍⚕️ Врач: {doctor.full_name}
+🏥 Отделение: {department.name}
+📅 Дата: {date_str}
+⏰ Время: {time_str}
+👤 Пациент: {context.user_data['patient_name']}
+📱 Телефон: {context.user_data['patient_phone']}
+"""
+
+        if "patient_birthdate" in context.user_data:
+            birthdate_str = datetime.strptime(
+                context.user_data["patient_birthdate"], "%Y-%m-%d"
+            ).strftime("%d.%m.%Y")
+            confirm_text += f"🎂 Дата рождения: {birthdate_str}\n"
+
+        if "symptoms" in context.user_data:
+            symptoms_text = context.user_data["symptoms"][:100] + "..." \
+                if len(context.user_data["symptoms"]) > 100 else context.user_data["symptoms"]
+            confirm_text += f"📝 Симптомы: {symptoms_text}\n"
+
+        confirm_text += "\n⚠️ Запись можно отменить не позднее чем за 24 часа до приема.\n"
+        confirm_text += "\nВсё верно?"
+
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Подтвердить", callback_data="confirm_yes"),
+                InlineKeyboardButton("❌ Отменить", callback_data="confirm_no")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await update.message.reply_text(
+            confirm_text,
+            reply_markup=reply_markup,
+            reply_to_message_id=update.message.message_id
+        )
+
+        return CONFIRM
+
+    async def confirm_appointment(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Подтверждение записи"""
+        query = update.callback_query
+        await query.answer()
+
+        if query.data == "confirm_no":
+            await query.edit_message_text(
+                "❌ Запись отменена.\n\n"
+                "Если передумаете, нажмите /record для новой записи."
+            )
+            return ConversationHandler.END
+
+        # Сохраняем запись в БД
+        try:
+            async with db.get_session() as session:
+                # Создаем запись
+                appointment = Appointment(
+                    user_id=update.effective_user.id,
+                    doctor_id=context.user_data["doctor_id"],
+                    appointment_date=datetime.strptime(
+                        context.user_data["appointment_date"], "%Y-%m-%d"
+                    ).date(),
+                    appointment_time=datetime.strptime(
+                        context.user_data["appointment_time"], "%H:%M"
+                    ).time(),
+                    patient_name=context.user_data["patient_name"],
+                    patient_phone=context.user_data["patient_phone"],
+                    patient_birthdate=datetime.strptime(
+                        context.user_data.get("patient_birthdate", "2000-01-01"), "%Y-%m-%d"
+                    ).date() if "patient_birthdate" in context.user_data else None,
+                    symptoms=context.user_data.get("symptoms"),
+                    status="confirmed"
+                )
+
+                session.add(appointment)
+                await session.flush()  # Получаем ID записи
+
+                # Получаем информацию о враче для сообщения
+                result = await session.execute(
+                    select(Doctor).where(Doctor.id == context.user_data["doctor_id"])
+                )
+                doctor = result.scalar_one()
+
+                result = await session.execute(
+                    select(Department).where(Department.id == doctor.department_id)
+                )
+                department = result.scalar_one()
+
+                await session.commit()
+
+            # Формируем сообщение об успехе
+            date_str = datetime.strptime(
+                context.user_data["appointment_date"], "%Y-%m-%d"
+            ).strftime("%d.%m.%Y")
+
+            success_text = f"""
+🎉 Запись успешно создана!
+
+📋 Номер записи: #{appointment.id}
+👨‍⚕️ Врач: {doctor.full_name}
+🏥 Отделение: {department.name} (каб. {department.room})
+📅 Дата: {date_str}
+⏰ Время: {context.user_data['appointment_time']}
+👤 Пациент: {context.user_data['patient_name']}
+
+📌 Важная информация:
+1. Приходите за 10-15 минут до назначенного времени
+2. Возьмите с собой паспорт и страховой полис
+3. Запись можно отменить командой /cancel_record
+
+📍 Адрес: ул. Медицинская, д. 15
+🚇 Метро: "Медицинская" (выход №3)
+
+Сохраните это сообщение!
+            """
+
+            # Планируем напоминание
+            appointment_datetime = datetime.combine(
+                appointment.appointment_date,
+                appointment.appointment_time
+            )
+
+            # Напоминание за день
+            reminder_time = appointment_datetime - timedelta(days=1)
+            if reminder_time > datetime.now():
+                context.job_queue.run_once(
+                    self.send_reminder,
+                    when=reminder_time,
+                    data=update.effective_user.id,
+                    name=f"reminder_{appointment.id}"
+                )
+
+            # Напоминание за 2 часа
+            reminder_2h = appointment_datetime - timedelta(hours=2)
+            if reminder_2h > datetime.now():
+                context.job_queue.run_once(
+                    self.send_reminder_2h,
+                    when=reminder_2h,
+                    data=update.effective_user.id,
+                    name=f"reminder_2h_{appointment.id}"
+                )
+
+            await query.edit_message_text(success_text)
+
+        except Exception as e:
+            logger.error(f"Error creating appointment: {e}")
+            await query.edit_message_text(
+                "❌ Произошла ошибка при создании записи. "
+                "Пожалуйста, попробуйте позже или обратитесь в регистратуру."
+            )
+
+        return ConversationHandler.END
+
+    async def send_reminder(self, context: ContextTypes.DEFAULT_TYPE):
+        """Отправка напоминания за день"""
+        user_id = context.job.data
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="🔔 Напоминание: Завтра у вас запись к врачу! "
+                     "Не забудьте взять документы."
+            )
+        except Exception as e:
+            logger.error(f"Error sending reminder: {e}")
+
+    async def send_reminder_2h(self, context: ContextTypes.DEFAULT_TYPE):
+        """Отправка напоминания за 2 часа"""
+        user_id = context.job.data
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="⏰ Напоминание: Через 2 часа у вас запись к врачу!"
+            )
+        except Exception as e:
+            logger.error(f"Error sending 2h reminder: {e}")
+
+    async def my_records(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Просмотр своих записей"""
+        user_id = update.effective_user.id
+
+        try:
+            async with db.get_session() as session:
+                result = await session.execute(
+                    select(Appointment, Doctor, Department)
+                    .join(Doctor, Appointment.doctor_id == Doctor.id)
+                    .join(Department, Doctor.department_id == Department.id)
+                    .where(Appointment.user_id == user_id)
+                    .where(Appointment.status.in_(["pending", "confirmed"]))
+                    .order_by(Appointment.appointment_date, Appointment.appointment_time)
+                )
+                records = result.all()
+
+            if not records:
+                await update.message.reply_text(
+                    "📭 У вас нет активных записей.\n\n"
+                    "Для записи нажмите /record"
+                )
+                return
+
+            text = "📋 Ваши активные записи:\n\n"
+
+            for appointment, doctor, department in records:
+                date_str = appointment.appointment_date.strftime("%d.%m.%Y")
+                time_str = appointment.appointment_time.strftime("%H:%M")
+
+                text += f"""
+📋 Запись №{appointment.id}
+👨‍⚕️ Врач: {doctor.full_name}
+🏥 Отделение: {department.name}
+📅 Дата: {date_str}
+⏰ Время: {time_str}
+👤 Пациент: {appointment.patient_name}
+📞 Телефон: {appointment.patient_phone}
+🔄 Статус: {appointment.status}
+────────────────────
+"""
+
+            # Добавляем кнопки для управления записями
+            keyboard = [
+                [
+                    InlineKeyboardButton("❌ Отменить запись", callback_data="cancel_record_menu"),
+                    InlineKeyboardButton("📅 Новая запись", callback_data="new_record")
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await update.message.reply_text(text, reply_markup=reply_markup)
+
+        except Exception as e:
+            logger.error(f"Error fetching records: {e}")
+            await update.message.reply_text(
+                "❌ Произошла ошибка при получении записей. "
+                "Пожалуйста, попробуйте позже."
+            )
+
+    async def show_departments(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показать отделения"""
+        try:
+            async with db.get_session() as session:
+                result = await session.execute(
+                    select(Department)
+                    .where(Department.is_active == True)
+                    .order_by(Department.name)
+                )
+                departments = result.scalars().all()
+
+            if not departments:
+                await update.message.reply_text(
+                    "🏥 В настоящее время нет доступных отделений."
+                )
+                return
+
+            text = "🏥 Отделения нашей больницы:\n\n"
+
+            for dept in departments:
+                text += f"• {dept.name}"
+                if dept.description:
+                    text += f" - {dept.description}"
+                if dept.floor:
+                    text += f" ({dept.floor} этаж, каб. {dept.room})"
+                text += "\n"
+
+            keyboard = [
+                [InlineKeyboardButton("👨‍⚕️ Врачи отделения", callback_data="show_doctors_list")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await update.message.reply_text(text, reply_markup=reply_markup)
+
+        except Exception as e:
+            logger.error(f"Error showing departments: {e}")
+            await update.message.reply_text(
+                "❌ Произошла ошибка при получении списка отделений."
+            )
+
+    async def show_doctors(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показать врачей"""
+        try:
+            async with db.get_session() as session:
+                result = await session.execute(
+                    select(Doctor, Department)
+                    .join(Department, Doctor.department_id == Department.id)
+                    .where(Doctor.is_active == True)
+                    .order_by(Department.name, Doctor.full_name)
+                )
+                doctors = result.all()
+
+            if not doctors:
+                await update.message.reply_text("👨‍⚕️ В настоящее время нет доступных врачей.")
+                return
+
+            text = "👨‍⚕️ Наши врачи:\n\n"
+
+            current_dept = None
+            for doctor, department in doctors:
+                if current_dept != department.name:
+                    text += f"\n🏥 {department.name}:\n"
+                    current_dept = department.name
+
+                text += f"• {doctor.full_name} - {doctor.specialization}"
+                if doctor.qualification:
+                    text += f" ({doctor.qualification})"
+                if doctor.experience:
+                    text += f", опыт {doctor.experience} лет"
+                text += "\n"
+
+            keyboard = [
+                [InlineKeyboardButton("📅 Записаться на прием", callback_data="start_record_from_doctors")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await update.message.reply_text(text, reply_markup=reply_markup)
+
+        except Exception as e:
+            logger.error(f"Error showing doctors: {e}")
+            await update.message.reply_text(
+                "❌ Произошла ошибка при получении списка врачей."
+            )
+
+    async def cancel_record(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Отмена записи"""
+        user_id = update.effective_user.id
+
+        try:
+            async with db.get_session() as session:
+                # Получаем активные записи пользователя
+                result = await session.execute(
+                    select(Appointment, Doctor)
+                    .join(Doctor, Appointment.doctor_id == Doctor.id)
+                    .where(Appointment.user_id == user_id)
+                    .where(Appointment.status.in_(["pending", "confirmed"]))
+                    .where(Appointment.appointment_date >= datetime.now().date())
+                    .order_by(Appointment.appointment_date)
+                )
+                appointments = result.all()
+
+            if not appointments:
+                await update.message.reply_text(
+                    "📭 У вас нет активных записей для отмены."
+                )
+                return
+
+            # Создаем клавиатуру с записями для отмены
+            keyboard = []
+            for appointment, doctor in appointments:
+                date_str = appointment.appointment_date.strftime("%d.%m.%Y")
+                time_str = appointment.appointment_time.strftime("%H:%M")
+
+                button_text = f"❌ {date_str} {time_str} - {doctor.full_name}"
+                if len(button_text) > 64:
+                    button_text = button_text[:61] + "..."
+
+                keyboard.append([
+                    InlineKeyboardButton(
+                        button_text,
+                        callback_data=f"cancel_{appointment.id}"
+                    )
+                ])
+
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await update.message.reply_text(
+                "❌ Выберите запись для отмены:",
+                reply_markup=reply_markup
+            )
+
+        except Exception as e:
+            logger.error(f"Error in cancel_record: {e}")
+            await update.message.reply_text(
+                "❌ Произошла ошибка. Пожалуйста, попробуйте позже."
+            )
+
+    async def process_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка отмены записи"""
+        query = update.callback_query
+        await query.answer()
+
+        appointment_id = int(query.data.split("_")[1])
+
+        try:
+            async with db.get_session() as session:
+                # Получаем запись
+                result = await session.execute(
+                    select(Appointment)
+                    .where(Appointment.id == appointment_id)
+                    .where(Appointment.user_id == query.from_user.id)
+                )
+                appointment = result.scalar_one_or_none()
+
+                if not appointment:
+                    await query.edit_message_text(
+                        "❌ Запись не найдена или у вас нет прав для ее отмены."
+                    )
+                    return
+
+                # Проверяем, можно ли отменить (не позднее чем за 24 часа)
+                appointment_datetime = datetime.combine(
+                    appointment.appointment_date,
+                    appointment.appointment_time
+                )
+
+                if datetime.now() + timedelta(hours=24) > appointment_datetime:
+                    await query.edit_message_text(
+                        "❌ Запись можно отменить не позднее чем за 24 часа до приема.\n\n"
+                        "Для отмены срочной записи позвоните в регистратуру: +7 (XXX) XXX-XX-XX"
+                    )
+                    return
+
+                # Отменяем запись
+                appointment.status = "cancelled"
+                await session.commit()
+
+                # Удаляем напоминания
+                job_name_reminder = f"reminder_{appointment.id}"
+                job_name_reminder_2h = f"reminder_2h_{appointment.id}"
+
+                if job_name_reminder in context.job_queue.jobs():
+                    context.job_queue.jobs()[job_name_reminder].schedule_removal()
+                if job_name_reminder_2h in context.job_queue.jobs():
+                    context.job_queue.jobs()[job_name_reminder_2h].schedule_removal()
+
+                await query.edit_message_text(
+                    "✅ Запись успешно отменена.\n\n"
+                    "Надеемся видеть вас снова!"
+                )
+
+        except Exception as e:
+            logger.error(f"Error cancelling appointment: {e}")
+            await query.edit_message_text(
+                "❌ Произошла ошибка при отмене записи. "
+                "Пожалуйста, попробуйте позже или позвоните в регистратуру."
+            )
+
+    async def admin_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Панель администратора"""
+        user_id = update.effective_user.id
+
+        # Проверяем, является ли пользователь администратором
+        if user_id != config.ADMIN_ID:
+            await update.message.reply_text("❌ У вас нет прав доступа к этой команде.")
+            return
+
+        keyboard = [
+            [
+                InlineKeyboardButton("📊 Статистика", callback_data="admin_stats"),
+                InlineKeyboardButton("📋 Записи", callback_data="admin_appointments")
+            ],
+            [
+                InlineKeyboardButton("👨‍⚕️ Врачи", callback_data="admin_doctors"),
+                InlineKeyboardButton("🏥 Отделения", callback_data="admin_departments")
+            ],
+            [
+                InlineKeyboardButton("📈 Отчеты", callback_data="admin_reports"),
+                InlineKeyboardButton("⚙️ Настройки", callback_data="admin_settings")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await update.message.reply_text(
+            "👑 Панель администратора\n\n"
+            "Выберите раздел для управления:",
+            reply_markup=reply_markup
+        )
+
+    async def cancel_conversation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Отмена текущего диалога"""
+        await update.message.reply_text(
+            "❌ Действие отменено.",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return ConversationHandler.END
+
+    def _validate_phone(self, phone: str) -> bool:
+        """Валидация номера телефона"""
+        import re
+
+        # Удаляем все нецифровые символы, кроме +
+        cleaned = re.sub(r'[^\d+]', '', phone)
+
+        # Проверяем российские форматы
+        patterns = [
+            r'^\+7\d{10}$',  # +79161234567
+            r'^8\d{10}$',  # 89161234567
+            r'^7\d{10}$',  # 79161234567
+            r'^\d{10}$',  # 9161234567
+        ]
+
+        return any(re.match(pattern, cleaned) for pattern in patterns)
+
+    async def init_bot(self):
+        """Инициализация бота"""
+        # Инициализируем базу данных
+        await db.init()
+
+        # Создаем Application
+        self.app = Application.builder().token(config.BOT_TOKEN).build()
+
+        # Добавляем обработчики
+
+        # ConversationHandler для записи
+        conv_handler = ConversationHandler(
+            entry_points=[
+                CommandHandler("record", self.start_record),
+                MessageHandler(filters.Regex("^(📅 Записаться на прием)$"), self.start_record),
+                CallbackQueryHandler(self.start_record, pattern="^start_record_from_doctors$")
+            ],
+            states={
+                SELECT_DEPARTMENT: [CallbackQueryHandler(self.select_department)],
+                SELECT_DOCTOR: [CallbackQueryHandler(self.select_doctor)],
+                SELECT_DATE: [CallbackQueryHandler(self.select_date)],
+                SELECT_TIME: [CallbackQueryHandler(self.select_time)],
+                ENTER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.enter_name)],
+                ENTER_PHONE: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.enter_phone),
+                    MessageHandler(filters.CONTACT, self.enter_phone)
+                ],
+                ENTER_BIRTHDATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.enter_birthdate)],
+                ENTER_SYMPTOMS: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.enter_symptoms)],
+                CONFIRM: [CallbackQueryHandler(self.confirm_appointment)]
+            },
+            fallbacks=[
+                CommandHandler("cancel", self.cancel_conversation),
+                MessageHandler(filters.Regex("^(Отмена|❌ Отмена)$"), self.cancel_conversation)
+            ]
+        )
+
+        # Обработчики команд
+        self.app.add_handler(CommandHandler("start", self.start))
+        self.app.add_handler(conv_handler)
+        self.app.add_handler(CommandHandler("my_records", self.my_records))
+        self.app.add_handler(CommandHandler("cancel_record", self.cancel_record))
+        self.app.add_handler(CommandHandler("admin", self.admin_panel))
+
+        # Обработчики кнопок
+        self.app.add_handler(MessageHandler(filters.Regex("^(📋 Мои записи)$"), self.my_records))
+        self.app.add_handler(MessageHandler(filters.Regex("^(🏥 Отделения)$"), self.show_departments))
+        self.app.add_handler(MessageHandler(filters.Regex("^(👨‍⚕️ Наши врачи)$"), self.show_doctors))
+
+        # CallbackQuery обработчики
+        self.app.add_handler(CallbackQueryHandler(self.show_doctors, pattern="^show_doctors_list$"))
+        self.app.add_handler(CallbackQueryHandler(self.process_cancel, pattern="^cancel_"))
+
+        # Обработчик текстовых сообщений (последним)
+        self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
+
+        # Обработчик ошибок
+        self.app.add_error_handler(self.error_handler)
+
+        logger.info("Бот инициализирован успешно")
+
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка текстовых сообщений"""
+        text = update.message.text
+
+        if text == "Отмена" or text == "❌ Отмена":
+            await self.cancel_conversation(update, context)
+        else:
+            await update.message.reply_text(
+                "Я не понимаю эту команду. Используйте /start для просмотра доступных команд."
+            )
+
+    async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка ошибок"""
+        logger.error(f"Exception while handling an update: {context.error}")
+
+        if update and update.effective_message:
+            await update.effective_message.reply_text(
+                "❌ Произошла ошибка. Пожалуйста, попробуйте позже или обратитесь в техническую поддержку."
+            )
+
+    async def run(self):
+        """Запуск бота"""
+        if not self.app:
+            await self.init_bot()
+
+        logger.info("Запуск бота...")
+        await self.app.run_polling(allowed_updates=Update.ALL_UPDATES)
+
+    async def shutdown(self):
+        """Завершение работы"""
+        await db.close()
+        logger.info("Бот завершил работу")
+
+
+# Главная функция
+async def main():
+    bot = HospitalBot()
+    try:
+        await bot.run()
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Получен сигнал завершения работы...")
+    finally:
+        await bot.shutdown()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
